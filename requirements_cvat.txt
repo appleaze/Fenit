@@ -1,0 +1,7 @@
+ultralytics
+cvat-sdk
+Pillow
+scikit-learn
+opencv-python
+numpy
+optuna

@@ -192,7 +192,7 @@ def get_square_from_grid(x, y, h_grid, v_grid):
             
     return col, row
 
-def run_inference(image_path, model_path="runs/chess_pose_train/weights/best.pt", output_dir="result/", grid_method="geometric"):
+def run_inference(image_path, model_path="runs/chess_pose_train/weights/best.pt", output_dir="result/", grid_method="geometric", force_estimate=False):
     print(f"Loading model from {model_path}...")
     try:
         model = YOLO(model_path)
@@ -258,11 +258,13 @@ def run_inference(image_path, model_path="runs/chess_pose_train/weights/best.pt"
                  print(f"  -> Skipped selection (not enough keypoints: {len(points)})")
 
     board_corners = None
-    if best_board_idx != -1:
+    if best_board_idx != -1 and not force_estimate:
         print(f"Selected Best Board (Index {best_board_idx}) with Confidence {max_conf:.4f}")
         kpts = results.keypoints.data[best_board_idx]
         points = kpts.cpu().numpy()
         board_corners = points[:4, :2]
+    elif force_estimate:
+        print("Ignoring Model-Detected Board (Force Estimate Enabled).")
     else:
         print("No board detected by model with sufficient confidence.")
 
@@ -274,7 +276,7 @@ def run_inference(image_path, model_path="runs/chess_pose_train/weights/best.pt"
     
     if estimated_corners is not None:
         if board_corners is None:
-             print("Using ESTIMATED board from piece locations (Fallback).")
+             print("Using ESTIMATED board from piece locations (Fallback/Forced).")
              board_corners = estimated_corners
         else:
              print("Using Model-Detected Board Corners for Warping (Preferred).")
@@ -604,6 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="runs/chess_pose_train/weights/best.pt", help="Path to trained model")
     parser.add_argument("--output-dir", default="result/", help="Directory to save results")
     parser.add_argument("--grid-method", default="geometric", choices=["geometric", "canny"], help="Grid detection method: geometric (default) or canny")
+    parser.add_argument("--force-estimate", action="store_true", help="Force estimation of board from piece locations, ignoring model board detection")
     args = parser.parse_args()
     
-    run_inference(args.image, args.model, args.output_dir, args.grid_method)
+    run_inference(args.image, args.model, args.output_dir, args.grid_method, force_estimate=args.force_estimate)

@@ -43,6 +43,9 @@ runs/
 dataset_final/
 result/
 archive*/
+training/
+manual_annotate_dataset/
+dataset/
 
 # Models
 *.pt
@@ -52,4 +55,5 @@ archive*/
 # Logs & Databases
 optuna.log
 optuna_chess.db
+optuna_manual_annotate.db
 *.log

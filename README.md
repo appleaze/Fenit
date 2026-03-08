@@ -71,5 +71,16 @@ Convert CVAT-exported COCO JSON annotations to YOLO format:
 python cvat_workflow.py convert --annotations-dir <dir_with_jsons>
 ```
 
-## 5. Results
-Output logs and weights will be saved to `runs/chess_pose_train`. Check `runs/chess_pose_train/train_batch0.jpg` to verify data loading.
+## 5. Custom Dataset Training ('dataset')
+We also support training on your manually annotated dataset (`dataset` folder).
+
+*   **Config**: `data_custom.yaml`
+*   **Script**: `train_custom.py`
+
+To run:
+```bash
+python train_custom.py
+```
+
+## 6. Results
+Output logs and weights will be saved to `runs/chess_pose_train` (main) or `runs/custom_dataset_train` (custom). Check `runs/chess_pose_train/train_batch0.jpg` to verify data loading.

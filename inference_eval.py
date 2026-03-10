@@ -335,6 +335,7 @@ def process_single_image(image_path, model, output_dir="result/", grid_method="g
         h_grid = np.linspace(0, 500, 9)
         
     M = processor.transform_matrix
+    debug_warped = None
     
     if processor.warped_image is not None and output_dir:
          warped_path = os.path.join(output_dir, "debug_warped.jpg")

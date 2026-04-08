@@ -1,696 +1,730 @@
+"""
+inference_eval.py
+=================
+Original YOLO chess-piece inference pipeline.
+
+Pipeline stages
+---------------
+1.  YOLO pose inference       → detections (box, class, keypoints)
+2.  Board-corner selection    → highest-confidence class-0 detection
+3.  Piece-hull fallback       → estimate corners from piece positions
+4.  Perspective warp          → normalise board to 500 × 500 px
+5.  Grid line detection       → geometric or Canny-based 9-line grids
+6.  Piece-to-cell assignment  → simple boundary lookup
+7.  Orientation correction    → piece-average heuristic
+8.  FEN generation            → board_to_fen()
+
+Usage
+-----
+  # single image
+  python inference_eval.py path/to/image.jpg
+
+  # run on a directory (random sample of 20)
+  python inference_eval.py path/to/folder/
+
+  # specify model / output dir
+  python inference_eval.py image.jpg \\
+      --model runs/manual_annotate_tuning/trial_11/weights/last.pt \\
+      --output-dir result/
+
+  # force board estimation from piece convex hull
+  python inference_eval.py image.jpg --force-estimate
+"""
+
+import os
+import random
+from pathlib import Path
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from chess_board import ChessBoardProcessor
-import os
-from pathlib import Path
-import random
 
-def get_piece_mapping():
-    # Matches 'names' in manual_annotate_dataset/data.yaml
+from chess_board import ChessBoardProcessor
+
+# ── Default paths ──────────────────────────────────────────────────────────
+DEFAULT_MODEL     = "runs/manual_annotate_tuning/trial_11/weights/last.pt"
+DEFAULT_OUTPUT    = "result/"
+DEFAULT_GRID      = "geometric"
+WARP_SIZE         = 500   # square side length after perspective warp (px)
+SNAP_MARGIN       = 25.0  # px tolerance to snap a piece just outside the grid
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PIECE MAPPING
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_piece_mapping() -> dict[int, str]:
+    """Return the YOLO class-ID → FEN character mapping.
+
+    Class IDs match the 'names' list in manual_annotate_dataset/data.yaml.
+    Upper-case = White pieces, lower-case = Black pieces.
+    """
     return {
-        1: 'K',  # White-King
-        2: 'P',  # White-Pawn
-        3: 'p',  # Black-Pawn
-        4: 'k',  # Black-King
-        5: 'Q',  # White-Queen
-        6: 'B',  # White-Bishop
-        7: 'N',  # White-Knight
-        8: 'R',  # White-Rook
-        9: 'b',  # Black-Bishop
-        10: 'r', # Black-Rook
-        11: 'n', # Black-Knight
-        12: 'q'  # Black-Queen
+        1:  'K',   # White King
+        2:  'P',   # White Pawn
+        3:  'p',   # Black Pawn
+        4:  'k',   # Black King
+        5:  'Q',   # White Queen
+        6:  'B',   # White Bishop
+        7:  'N',   # White Knight
+        8:  'R',   # White Rook
+        9:  'b',   # Black Bishop
+        10: 'r',   # Black Rook
+        11: 'n',   # Black Knight
+        12: 'q',   # Black Queen
     }
 
-def board_to_fen(board):
+
+# ══════════════════════════════════════════════════════════════════════════
+# FEN UTILITIES
+# ══════════════════════════════════════════════════════════════════════════
+
+def board_to_fen(board: list[list[str]]) -> str:
+    """Convert an 8×8 board (list-of-lists, '.' = empty) to a FEN string.
+
+    Appends the standard suffix for "White to move, no castling, no en-
+    passant, 0 half-moves, move 1".
+    """
     fen_rows = []
     for row in board:
-        empty_count = 0
-        fen_row = ""
+        empty = 0
+        row_str = ""
         for cell in row:
             if cell == '.':
-                empty_count += 1
+                empty += 1
             else:
-                if empty_count > 0:
-                    fen_row += str(empty_count)
-                    empty_count = 0
-                fen_row += cell
-        if empty_count > 0:
-            fen_row += str(empty_count)
-        fen_rows.append(fen_row)
-    
-    # Default FEN suffix: White to move, no castling, no en passant, 0 halfmoves, 1 fullmove
-    # You can adjust this if your model detects whose turn it is
-    # You can adjust this if your model detects whose turn it is
+                if empty:
+                    row_str += str(empty)
+                    empty = 0
+                row_str += cell
+        if empty:
+            row_str += str(empty)
+        fen_rows.append(row_str)
+
     return "/".join(fen_rows) + " w - - 0 1"
 
-def estimate_board_from_pieces(results):
+
+def parse_fen_from_filename(stem: str) -> str | None:
+    """Extract a board-FEN from a filename that encodes FEN with _ or - separators.
+
+    A valid 8-rank FEN has exactly 7 separators → 8 parts.
+    Returns the board-FEN portion (before any trailing space / suffix), or None.
     """
-    Estimates the board corners based on the locations of detected pieces.
-    Returns: numpy array of 4 corners (TL, TR, BR, BL) or None
+    n_under = stem.count('_')
+    n_dash  = stem.count('-')
+
+    if n_under == 7:
+        raw = stem.replace('_', '/')
+    elif n_dash == 7:
+        raw = stem.replace('-', '/')
+    else:
+        return None  # not a FEN filename
+
+    # Strip trailing metadata such as " w", "(board)", "_aug_N"
+    return raw.split(' ')[0].split('(')[0].strip()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BOARD-CORNER ESTIMATION
+# ══════════════════════════════════════════════════════════════════════════
+
+def estimate_board_from_pieces(results) -> np.ndarray | None:
+    """Estimate board corners from the convex hull of all detected piece bases.
+
+    Returns a (4, 2) float32 array [TL, TR, BR, BL] expanded by 15 % outward
+    to reach the board edge, or None if fewer than 4 piece points are found.
     """
     piece_points = []
-    
-    # Collect all piece positions
-    for kpts, cls in zip(results.keypoints.data, results.boxes.cls):
-        class_id = int(cls)
-        if class_id == 0: continue # Skip board
-        
-        points = kpts.cpu().numpy()
-        if len(points) >= 3:
-            # keypoints: [base1, base2, base3, top]
-            # Use average of base points for board contact
-            base_points = points[:3, :2]
-            piece_x = np.mean(base_points[:, 0])
-            piece_y = np.mean(base_points[:, 1])
-            piece_points.append([piece_x, piece_y])
-            
-    if len(piece_points) < 4:
-        print(f"Not enough pieces ({len(piece_points)}) to estimate board.")
-        return None
-        
-    points = np.array(piece_points, dtype=np.float32)
-    
-    # Find Min Area Rotated Rectangle
-    rect = cv2.minAreaRect(points)
-    box = cv2.boxPoints(rect)
-    box = np.int8(box) # Keeping it float is better for precision, but boxPoints returns float32 usually? 
-    # cv2.boxPoints returns float32, let's keep it
-    box = np.array(cv2.boxPoints(rect), dtype=np.float32)
-    
-    # Expand the box slightly (e.g. 10%) to include the squares and margins
-    # The rect result is (center(x, y), (width, height), angle)
-    center, size, angle = rect
-    w, h = size
-    
-    # Expansion factor: Pieces are on squares, we want the board edge.
-    # Assuming pieces are filling the board reasonably well, maybe 10-15% padding?
-    padding = 1.15 
-    new_size = (w * padding, h * padding)
-    
-    new_rect = (center, new_size, angle)
-    expanded_box = cv2.boxPoints(new_rect)
-    expanded_box = np.array(expanded_box, dtype=np.float32)
 
+    for kpts, cls in zip(results.keypoints.data, results.boxes.cls):
+        if int(cls) == 0:
+            continue  # skip the board class
+
+        pts = kpts.cpu().numpy()
+        if len(pts) >= 3:
+            # Use mean of the three base keypoints as the piece's board contact
+            base = pts[:3, :2]
+            piece_points.append([np.mean(base[:, 0]), np.mean(base[:, 1])])
+
+    if len(piece_points) < 4:
+        print(f"  [estimate] Only {len(piece_points)} pieces — too few to estimate board.")
+        return None
+
+    pts_arr = np.array(piece_points, dtype=np.float32)
+    rect    = cv2.minAreaRect(pts_arr)
+    center, (w_r, h_r), angle = rect
+
+    # Expand the minimal bounding rectangle to cover the full board
+    expanded_rect = (center, (w_r * 1.15, h_r * 1.15), angle)
+    expanded_box  = np.array(cv2.boxPoints(expanded_rect), dtype=np.float32)
     return expanded_box
 
-def interpolate_grid(lines, max_dim=500):
-    """
-    Interpolate 9 grid lines (boundaries 0..8) from detected lines.
-    If detected lines are good, use them. Else, fallback to uniform spacing.
-    Returns: list of 9 coordinates (offsets).
-    """
-    if not lines or len(lines) < 2:
-        # Fallback to uniform
-        return np.linspace(0, max_dim, 9)
-    
-    # Extract Rhos (assumed sorted)
-    rhos = [l[0] for l in lines]
-    
-    # Simple strategy:
-    # 1. Find the first and last valid lines (closest to 0 and 500)
-    # 2. Or if we have 9 lines, just use them?
-    # 3. Often we catch only inner lines.
-    
-    # Robust approach: Linear Fit
-    # Assume lines correspond to indices 0..8 (or 1..7).
-    # We don't know WHICH index they map to.
-    # But usually board covers 0-500.
-    
-    # Let's assume the first line is near index I and last near index J.
-    # Uniform spacing d ~ 500/8 = 62.5
-    
-    # Actually, for this task, the warp is FORCED to be 500x500.
-    # So we *expect* lines at 0, 62.5, 125, ... 500.
-    # We can snap detected lines to these slots and refine the slots.
-    
-    ideal_grid = np.linspace(0, max_dim, 9)
-    final_grid = ideal_grid.copy()
-    
-    # Snap detected lines
-    for rho in rhos:
-        # Find closest ideal line
-        idx = (np.abs(ideal_grid - rho)).argmin()
-        diff = rho - ideal_grid[idx]
-        
-        # If match is reasonably close (e.g. within 20px), update the grid point
-        # But we want to preserve uniform spacing? 
-        # Actually, if the board is warped non-linearly, non-uniform is better.
-        # But perspective transform should handle linearity.
-        # Let's just trust valid lines.
-        
-        if abs(diff) < 30:
-             final_grid[idx] = rho
-             
-    # Fill gaps (interpolate between locked points)
-    # This is slightly complex. Simpler: just return fixed grid if lines are sparse.
-    # Or: Just return the lines we found and fill the rest?
-    # Let's stick to FIXED grid if lines are messy, or use the lines if we have 9.
-    
-    # Given the complexity and "loose" estimation, relying on the lines might be unstable
-    # unless we force them to be 9 lines.
-    
-    # Let's try: JUST return fixed grid for now, but use lines if they are perfect.
-    # Actually, the user wants Phase 3.
-    # Let's use `chess_board.py` lines to refine the grid.
-    
-    return final_grid
 
-def get_square_from_grid(x, y, h_grid, v_grid):
+# ══════════════════════════════════════════════════════════════════════════
+# GRID UTILITIES
+# ══════════════════════════════════════════════════════════════════════════
+
+def interpolate_grid(detected_lines: list, max_dim: int = WARP_SIZE) -> np.ndarray:
+    """Snap detected Hough lines onto a 9-point ideal uniform grid.
+
+    Detected lines (rho values) that are within 30 px of an ideal grid
+    boundary are used to refine that boundary.  All others stay at the
+    uniform position.
+
+    Returns a shape-(9,) float64 array of grid boundaries.
     """
-    Find which row/col (0-7) the point (x,y) falls into.
-    h_grid: 9 y-coords (boundaries)
-    v_grid: 9 x-coords (boundaries)
-    Includes a tolerance margin to snap pieces slightly outside the grid.
+    ideal = np.linspace(0, max_dim, 9)
+
+    if not detected_lines or len(detected_lines) < 2:
+        return ideal  # fallback: pure uniform grid
+
+    final = ideal.copy()
+    for rho, in detected_lines if isinstance(detected_lines[0], (int, float)) \
+            else [(l[0],) for l in detected_lines]:
+        idx = int(np.argmin(np.abs(ideal - rho)))
+        if abs(rho - ideal[idx]) < 30:
+            final[idx] = rho
+
+    return final
+
+
+def get_square_from_grid(
+        x: float, y: float,
+        h_grid: np.ndarray, v_grid: np.ndarray
+) -> tuple[int, int]:
+    """Return (col, row) for a warped point (x, y), with ±25 px snap margin.
+
+    Returns (-1, -1) if the point is outside the grid + margin.
     """
     col = -1
     row = -1
-    
-    # Tolerance for snapping to edge (e.g. 25px to match 1.08 scale margin ~18px)
-    margin_tolerance = 25.0 
-    
-    # Check Columns (X)
-    # Check if inside grid range 0..7
-    if x >= v_grid[0] and x < v_grid[-1]:
+
+    # ── Column (X direction) ──────────────────────────────────────────────
+    if v_grid[0] <= x < v_grid[-1]:
         for i in range(8):
-            if v_grid[i] <= x < v_grid[i+1]:
+            if v_grid[i] <= x < v_grid[i + 1]:
                 col = i
                 break
-    else:
-        # Check margin
-        if v_grid[0] - margin_tolerance <= x < v_grid[0]:
-            col = 0 # Snap to Left Edge
-        elif v_grid[-1] <= x < v_grid[-1] + margin_tolerance:
-            col = 7 # Snap to Right Edge
-            
-    # Check Rows (Y)
-    if y >= h_grid[0] and y < h_grid[-1]:
+    elif v_grid[0] - SNAP_MARGIN <= x < v_grid[0]:
+        col = 0   # snap to left edge
+    elif v_grid[-1] <= x < v_grid[-1] + SNAP_MARGIN:
+        col = 7   # snap to right edge
+
+    # ── Row (Y direction) ─────────────────────────────────────────────────
+    if h_grid[0] <= y < h_grid[-1]:
         for i in range(8):
-            if h_grid[i] <= y < h_grid[i+1]:
+            if h_grid[i] <= y < h_grid[i + 1]:
                 row = i
                 break
-    else:
-         # Check margin
-         if h_grid[0] - margin_tolerance <= y < h_grid[0]:
-             row = 0 # Snap to Top Edge
-         elif h_grid[-1] <= y < h_grid[-1] + margin_tolerance:
-             row = 7 # Snap to Bottom Edge
-            
+    elif h_grid[0] - SNAP_MARGIN <= y < h_grid[0]:
+        row = 0   # snap to top edge
+    elif h_grid[-1] <= y < h_grid[-1] + SNAP_MARGIN:
+        row = 7   # snap to bottom edge
+
     return col, row
 
-def process_single_image(image_path, model, output_dir="result/", grid_method="geometric", force_estimate=False):
-    # Load image
-    img = cv2.imread(image_path)
-    if img is None:
-        print(f"Error: Could not read image {image_path}")
-        return
 
-    # Run YOLO inference
-    print("Running YOLO detection...")
-    results = model(img)[0]
-    
-    # Extract Board Corners (Class 0)
-    best_board_idx = -1
-    max_conf = -1.0
-    
-    print(f"Detected {len(results.boxes)} objects.")
-    
-    # Extract Board Corners (Class 0)
-    best_board_idx = -1
-    max_conf = -1.0
-    
-    print(f"Detected {len(results.boxes)} objects.")
-    
-    for i, (kpts, get_cls, conf, box) in enumerate(zip(results.keypoints.data, results.boxes.cls, results.boxes.conf, results.boxes.xyxy)):
-        class_id = int(get_cls)
-        confidence = float(conf)
-        
-        if class_id == 0: # Board
-            print(f"Board candidate {i}: Confidence={confidence:.4f}")
-            points = kpts.cpu().numpy()
-            
-            # DEBUG: Save visualization for THIS candidate
-            debug_img = img.copy()
-            
-            # Draw Box
-            x1, y1, x2, y2 = map(int, box.cpu().numpy())
-            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Draw Keypoints
-            for k_idx, point in enumerate(points):
-                 x, y = int(point[0]), int(point[1])
-                 cv2.circle(debug_img, (x, y), 8, (0, 0, 255), -1)
-                 cv2.putText(debug_img, f"{k_idx}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            
-            if output_dir:
-                 candidate_path = os.path.join(output_dir, f"debug_candidate_{i}_conf_{confidence:.2f}.jpg")
-                 cv2.imwrite(candidate_path, debug_img)
-                 print(f"  -> Saved debug image to {candidate_path}")
+# ══════════════════════════════════════════════════════════════════════════
+# ORIENTATION
+# ══════════════════════════════════════════════════════════════════════════
 
-            if len(points) >= 4:
-                # Check if this is the best board
-                if confidence > max_conf:
-                    max_conf = confidence
-                    best_board_idx = i
-            else:
-                 print(f"  -> Skipped selection (not enough keypoints: {len(points)})")
+def _rotate_board_180(board: list[list[str]]) -> list[list[str]]:
+    return [[board[7 - r][7 - c] for c in range(8)] for r in range(8)]
 
-    board_corners = None
-    if best_board_idx != -1 and not force_estimate:
-        print(f"Selected Best Board (Index {best_board_idx}) with Confidence {max_conf:.4f}")
-        kpts = results.keypoints.data[best_board_idx]
-        points = kpts.cpu().numpy()
-        board_corners = points[:4, :2]
-    elif force_estimate:
-        print("Ignoring Model-Detected Board (Force Estimate Enabled).")
-    else:
-        print("No board detected by model with sufficient confidence.")
-
-    # Fallback / Override: Estimate from pieces
-    # If the user says model board is wrong, we should prioritize estimation or provide it as option.
-    # Let's try estimation and compare or just use it if available for this specific debugging case.
-    print("Attempting to estimate board from pieces...")
-    estimated_corners = estimate_board_from_pieces(results)
-    
-    if estimated_corners is not None:
-        if board_corners is None:
-             print("Using ESTIMATED board from piece locations (Fallback/Forced).")
-             board_corners = estimated_corners
-        else:
-             print("Using Model-Detected Board Corners for Warping (Preferred).")
-        
-        # DEBUG: Visualize estimated corners
-        debug_est = img.copy()
-        for i, point in enumerate(estimated_corners):
-             x, y = int(point[0]), int(point[1])
-             cv2.circle(debug_est, (x, y), 10, (0, 255, 0), -1)
-             cv2.putText(debug_est, str(i), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-        
-        # Draw all pieces to see what defined the hull
-        for kpts, cls in zip(results.keypoints.data, results.boxes.cls):
-            if int(cls) == 0: continue
-            pts = kpts.cpu().numpy()
-            if len(pts) >= 3:
-                bx = np.mean(pts[:3, 0])
-                by = np.mean(pts[:3, 1])
-        if output_dir:
-             cv2.imwrite(os.path.join(output_dir, "debug_estimated_board.jpg"), debug_est)
-             
-    if board_corners is None:
-        print("Error: Could not determine board corners from model or estimation. Skipping image.")
-        return None
-    
-    # Collect Piece Points for Dynamic Expansion
-    piece_points_for_expansion = []
-    for kpts, cls in zip(results.keypoints.data, results.boxes.cls):
-        class_id = int(cls)
-        if class_id == 0: continue # Skip board
-        
-        pts = kpts.cpu().numpy()
-        if len(pts) >= 3:
-            # Use base points as the footprint
-            base_points = pts[:3, :2]
-            # Add all base points individually or just the mean?
-            # Dynamic expansion should cover the whole piece footprint on the board.
-            # Adding all 3 base points is safer.
-            for bp in base_points:
-                piece_points_for_expansion.append(bp)
-    
-    # Process Board (Warp & Grid)
-    processor = ChessBoardProcessor()
-    # Phase 3: Detect Grid Lines
-    # Pass piece_points for dynamic expansion
-    result = processor.process(img, board_corners, piece_points=piece_points_for_expansion, method=grid_method)
-    
-    if result is not None:
-        h_lines, v_lines = result
-        # Determine Grid Boundaries
-        v_grid = interpolate_grid(v_lines, 500)
-        h_grid = interpolate_grid(h_lines, 500)
-    else:
-        print("Warning: Grid line detection failed. Using uniform grid.")
-        h_lines, v_lines = [], []
-        v_grid = np.linspace(0, 500, 9)
-        h_grid = np.linspace(0, 500, 9)
-        
-    M = processor.transform_matrix
-    debug_warped = None
-    
-    if processor.warped_image is not None and output_dir:
-         warped_path = os.path.join(output_dir, "debug_warped.jpg")
-         debug_warped = processor.warped_image.copy()
-         
-         # Draw Grid Lines
-         for x in v_grid:
-             cv2.line(debug_warped, (int(x), 0), (int(x), 500), (0, 0, 255), 1) # Red Vertical
-         for y in h_grid:
-             cv2.line(debug_warped, (0, int(y)), (500, int(y)), (255, 0, 0), 1) # Blue Horizontal
-             
-         cv2.imwrite(warped_path, debug_warped)
-         print(f"Saved debug warped image to {warped_path}")
-
-    if M is None:
-        print("Error: Perspective warp failed.")
-        return
-
-    # Initialize 8x8 board (list of lists)
-    board_state = [['.' for _ in range(8)] for _ in range(8)]
-    # Keep track of confidence to resolve duplicates
-    board_conf = [[-1.0 for _ in range(8)] for _ in range(8)]
-    
-    piece_map = get_piece_mapping()
-
-    candidate_pieces = [] # list of dictionaries
-    
-    # Process detected pieces
-    for kpts, cls, conf in zip(results.keypoints.data, results.boxes.cls, results.boxes.conf):
-        class_id = int(cls)
-        if class_id == 0: continue # Skip board
-        
-        confidence = float(conf)
-        points = kpts.cpu().numpy()
-        
-        # Check dimensions
-        if len(points) >= 3:
-             base_points = points[:3, :2]
-        else:
-             base_points = points[:, :2] # Fallback
-             
-        # Mean of base points
-        piece_x = np.mean(base_points[:, 0])
-        piece_y = np.mean(base_points[:, 1])
-        
-        # Transform to grid
-        pt = np.array([[[piece_x, piece_y]]], dtype=np.float32)
-        if M is not None:
-             warped_pt = cv2.perspectiveTransform(pt, M)[0][0] # (x, y)
-             
-             # Get Grid indices
-             col, row = get_square_from_grid(warped_pt[0], warped_pt[1], h_grid, v_grid)
-             
-             piece_char = piece_map.get(class_id, '?')
-             candidate_pieces.append({
-                 'char': piece_char,
-                 'conf': confidence,
-                 'col': col,
-                 'row': row,
-                 'x': warped_pt[0],
-                 'y': warped_pt[1]
-             })
-             
-             # Draw on debug image
-             if debug_warped is not None:
-                  cv2.circle(debug_warped, (int(warped_pt[0]), int(warped_pt[1])), 4, (0, 255, 255), -1)
-
-    # Sort candidates by confidence (Descending)
-    candidate_pieces.sort(key=lambda x: x['conf'], reverse=True)
-    
-    # ---------------------------------------------------------
-    # NO CONFLICT RESOLUTION (Overwrite Standard)
-    # User requested removal of "missing knight" logic.
-    # ---------------------------------------------------------
-    for cand in candidate_pieces:
-        c, r = cand['col'], cand['row']
-        if c != -1 and r != -1:
-            # Only place if empty or overwrite with higher confidence?
-            # List is sorted by conf DESC. So first one wins.
-            if board_state[r][c] == '.':
-                 board_state[r][c] = cand['char']
-                 board_conf[r][c] = cand['conf']
-            else:
-                 # Already occupied by higher confidence piece
-                 pass
-
-    # ---------------------------------------------------------
-    # ORIENTATION LOGIC
-    # ---------------------------------------------------------
-    white_y_sum, white_x_sum, white_count = 0, 0, 0
-    black_y_sum, black_x_sum, black_count = 0, 0, 0
-    
+def _rotate_board_90(board: list[list[str]]) -> list[list[str]]:
+    """90° clockwise: (r, c) → (c, 7-r)."""
+    new = [['.' for _ in range(8)] for _ in range(8)]
     for r in range(8):
         for c in range(8):
-            char = board_state[r][c]
-            if char.isupper():
-                white_y_sum += r
-                white_x_sum += c
-                white_count += 1
-            elif char.islower():
-                black_y_sum += r
-                black_x_sum += c
-                black_count += 1
-                
-    if white_count > 0 and black_count > 0:
-        avg_white_y = white_y_sum / white_count
-        avg_black_y = black_y_sum / black_count
-        avg_white_x = white_x_sum / white_count
-        avg_black_x = black_x_sum / black_count
-        
-        print(f"Orientation Check: White Y={avg_white_y:.2f} X={avg_white_x:.2f}, Black Y={avg_black_y:.2f} X={avg_black_x:.2f}")
-        
-        # Determine Rotation
-        rotation = 0
-        
-        # Check Y-axis spread
-        if abs(avg_white_y - avg_black_y) > 2.0:
-            if avg_white_y < avg_black_y: # White is Up (Top)
-                rotation = 180
-                print("Orientation: White Top -> Rotate 180")
-            else:
-                print("Orientation: White Bottom (Standard)")
+            new[c][7 - r] = board[r][c]
+    return new
+
+def _rotate_board_270(board: list[list[str]]) -> list[list[str]]:
+    """270° clockwise: (r, c) → (7-c, r)."""
+    new = [['.' for _ in range(8)] for _ in range(8)]
+    for r in range(8):
+        for c in range(8):
+            new[7 - c][r] = board[r][c]
+    return new
+
+
+def correct_orientation(board: list[list[str]]) -> list[list[str]]:
+    """Rotate the board so White pieces are at the bottom (rows 6-7).
+
+    Uses the average row of all White pieces vs all Black pieces.
+    If the separation is predominantly horizontal (Y spread < X spread),
+    uses the average column instead.
+
+    Returns the (possibly rotated) board.
+    """
+    white_rows, white_cols = [], []
+    black_rows, black_cols = [], []
+
+    for r in range(8):
+        for c in range(8):
+            ch = board[r][c]
+            if ch.isupper():
+                white_rows.append(r); white_cols.append(c)
+            elif ch.islower():
+                black_rows.append(r); black_cols.append(c)
+
+    if not white_rows or not black_rows:
+        print("  [orient] Cannot determine orientation — missing one colour.")
+        return board
+
+    avg_wy = sum(white_rows) / len(white_rows)
+    avg_by = sum(black_rows) / len(black_rows)
+    avg_wx = sum(white_cols) / len(white_cols)
+    avg_bx = sum(black_cols) / len(black_cols)
+
+    print(f"  [orient] White avg (row={avg_wy:.2f}, col={avg_wx:.2f}), "
+          f"Black avg (row={avg_by:.2f}, col={avg_bx:.2f})")
+
+    y_spread = abs(avg_wy - avg_by)
+    x_spread = abs(avg_wx - avg_bx)
+
+    if y_spread > 2.0:
+        if avg_wy < avg_by:             # White at top → rotate 180
+            print("  [orient] White at top → rotate 180°")
+            return _rotate_board_180(board)
         else:
-            # Check X-axis spread (Sideways)
-            if abs(avg_white_x - avg_black_x) > 2.0:
-                if avg_white_x > avg_black_x: # White is Right
-                    rotation = 90 # CW
-                    print("Orientation: White Right -> Rotate 90 CW")
-                else: # White is Left
-                    rotation = 270 # CW (or -90)
-                    print("Orientation: White Left -> Rotate 270 CW")
-        
-        # Apply Rotation
-        if rotation == 90:
-             # (r, c) -> (c, 7-r)
-             new_state = [['.' for _ in range(8)] for _ in range(8)]
-             for r in range(8):
-                 for c in range(8):
-                     new_state[c][7-r] = board_state[r][c]
-             board_state = new_state
-        elif rotation == 180:
-             # (r, c) -> (7-r, 7-c)
-             new_state = [['.' for _ in range(8)] for _ in range(8)]
-             for r in range(8):
-                 for c in range(8):
-                     new_state[7-r][7-c] = board_state[r][c]
-             board_state = new_state
-        elif rotation == 270:
-             # (r, c) -> (7-c, r)
-             new_state = [['.' for _ in range(8)] for _ in range(8)]
-             for r in range(8):
-                 for c in range(8):
-                     new_state[7-c][r] = board_state[r][c]
-             board_state = new_state
-    
-    # Debug Print Board
-    print("\nDetected Board State:")
-    print("  a b c d e f g h")
-    for i, row in enumerate(board_state):
-        print(f"{8-i} " + " ".join(row))
+            print("  [orient] Standard (White at bottom) — no rotation")
+            return board
+    elif x_spread > 2.0:
+        if avg_wx > avg_bx:             # White at right → rotate 90 CW
+            print("  [orient] White at right → rotate 90° CW")
+            return _rotate_board_90(board)
+        else:                           # White at left → rotate 270 CW
+            print("  [orient] White at left → rotate 270° CW")
+            return _rotate_board_270(board)
 
-    # Generate FEN
-    fen = board_to_fen(board_state)
-    print(f"\nPredicted FEN: {fen}")
+    print("  [orient] Spread too small — returning board unchanged.")
+    return board
 
-    # Save results
+
+# ══════════════════════════════════════════════════════════════════════════
+# DEBUG VISUALISATION HELPERS
+# ══════════════════════════════════════════════════════════════════════════
+
+def _save_candidate_debug(img, kpts, box, index: int, conf: float, output_dir: str):
+    """Save a debug image highlighting one board-detection candidate."""
+    debug = img.copy()
+    x1, y1, x2, y2 = map(int, box.cpu().numpy())
+    cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    for ki, pt in enumerate(kpts.cpu().numpy()):
+        px, py = int(pt[0]), int(pt[1])
+        cv2.circle(debug, (px, py), 8, (0, 0, 255), -1)
+        cv2.putText(debug, str(ki), (px, py),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    path = os.path.join(output_dir, f"debug_candidate_{index}_conf_{conf:.2f}.jpg")
+    cv2.imwrite(path, debug)
+    print(f"  [debug] Candidate saved → {path}")
+
+
+def _draw_grid_on_warped(warped_img, h_grid, v_grid) -> np.ndarray:
+    """Return a copy of the warped image with grid lines drawn on it."""
+    dbg = warped_img.copy()
+    for x in v_grid:
+        cv2.line(dbg, (int(x), 0), (int(x), WARP_SIZE), (0, 0, 255), 1)
+    for y in h_grid:
+        cv2.line(dbg, (0, int(y)), (WARP_SIZE, int(y)), (255, 0, 0), 1)
+    return dbg
+
+
+def _draw_grid_on_original(annotated, M, h_grid, v_grid):
+    """Project the 500 × 500 grid back onto the original image via M_inv."""
+    try:
+        M_inv = np.linalg.inv(M)
+    except Exception as e:
+        print(f"  [debug] Could not invert warp matrix: {e}")
+        return annotated
+
+    def _project(pt_warp):
+        pt = np.array([[[float(pt_warp[0]), float(pt_warp[1])]]], dtype=np.float32)
+        return cv2.perspectiveTransform(pt, M_inv)[0][0]
+
+    # Vertical grid lines
+    for x in v_grid:
+        p1 = tuple(map(int, _project((x, 0))))
+        p2 = tuple(map(int, _project((x, WARP_SIZE))))
+        cv2.line(annotated, p1, p2, (0, 255, 255), 2)
+
+    # Horizontal grid lines
+    for y in h_grid:
+        p1 = tuple(map(int, _project((0, y))))
+        p2 = tuple(map(int, _project((WARP_SIZE, y))))
+        cv2.line(annotated, p1, p2, (0, 255, 255), 2)
+
+    # Board-corner dots
+    for cx, cy in [(0, 0), (WARP_SIZE, 0), (WARP_SIZE, WARP_SIZE), (0, WARP_SIZE)]:
+        orig = tuple(map(int, _project((cx, cy))))
+        cv2.circle(annotated, orig, 10, (0, 0, 255), -1)
+        cv2.circle(annotated, orig, 12, (255, 255, 255), 2)
+
+    return annotated
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CORE INFERENCE
+# ══════════════════════════════════════════════════════════════════════════
+
+def process_single_image(
+        image_path: str,
+        model,
+        output_dir: str  = DEFAULT_OUTPUT,
+        grid_method: str = DEFAULT_GRID,
+        force_estimate: bool = False,
+) -> str | None:
+    """Run the full detection → FEN pipeline on a single image.
+
+    Parameters
+    ----------
+    image_path    : Path to the input image.
+    model         : Loaded YOLO model instance.
+    output_dir    : Directory for debug/result files (None = skip saving).
+    grid_method   : 'geometric' or 'canny' (passed to ChessBoardProcessor).
+    force_estimate: If True, ignore the YOLO board class and always estimate
+                    corners from piece positions.
+
+    Returns
+    -------
+    The predicted FEN string (e.g. "rnbqkbnr/... w - - 0 1"), or None on failure.
+    """
+    # ── 1. Load image ─────────────────────────────────────────────────────
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"[Error] Cannot read image: {image_path}")
+        return None
+
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        base_name = Path(image_path).stem
-        
-        # Save FEN
-        fen_path = os.path.join(output_dir, f"{base_name}.txt")
-        with open(fen_path, "w") as f:
+
+    # ── 2. YOLO inference ─────────────────────────────────────────────────
+    print("Running YOLO detection...")
+    results = model(img)[0]
+    print(f"  Detected {len(results.boxes)} objects.")
+
+    # ── 3. Board-corner selection ─────────────────────────────────────────
+    board_corners = None
+
+    if not force_estimate:
+        best_idx  = -1
+        best_conf = -1.0
+
+        for i, (kpts, cls, conf, box) in enumerate(zip(
+                results.keypoints.data, results.boxes.cls,
+                results.boxes.conf,   results.boxes.xyxy)):
+
+            if int(cls) != 0:
+                continue  # only interested in the board class
+
+            c = float(conf)
+            print(f"  Board candidate {i}: conf={c:.4f}")
+
+            if output_dir:
+                _save_candidate_debug(img, kpts, box, i, c, output_dir)
+
+            pts = kpts.cpu().numpy()
+            if len(pts) >= 4 and c > best_conf:
+                best_conf = c
+                best_idx  = i
+
+        if best_idx != -1:
+            print(f"  Selected board candidate {best_idx} (conf={best_conf:.4f})")
+            pts = results.keypoints.data[best_idx].cpu().numpy()
+            board_corners = pts[:4, :2].astype(np.float32)
+        else:
+            print("  No board detected with ≥4 keypoints.")
+    else:
+        print("  Force-estimate mode — ignoring YOLO board class.")
+
+    # ── 4. Piece-hull fallback ────────────────────────────────────────────
+    print("Estimating board from piece positions (for comparison / fallback)...")
+    estimated = estimate_board_from_pieces(results)
+
+    if estimated is not None:
+        if board_corners is None:
+            print("  Using estimated corners (no YOLO board / force mode).")
+            board_corners = estimated
+        else:
+            print("  YOLO board corners preferred over estimate.")
+
+        if output_dir:
+            dbg_est = img.copy()
+            for j, pt in enumerate(estimated):
+                px, py = int(pt[0]), int(pt[1])
+                cv2.circle(dbg_est, (px, py), 10, (0, 255, 0), -1)
+                cv2.putText(dbg_est, str(j), (px, py),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            cv2.imwrite(os.path.join(output_dir, "debug_estimated_board.jpg"), dbg_est)
+
+    if board_corners is None:
+        print("[Error] Could not determine board corners. Skipping.")
+        return None
+
+    # ── 5. Piece base-points for dynamic board expansion ──────────────────
+    piece_bases = []
+    for kpts, cls in zip(results.keypoints.data, results.boxes.cls):
+        if int(cls) == 0:
+            continue
+        pts = kpts.cpu().numpy()
+        if len(pts) >= 3:
+            for bp in pts[:3, :2]:
+                piece_bases.append(bp)
+
+    # ── 6. Perspective warp + grid detection ─────────────────────────────
+    processor = ChessBoardProcessor()
+    grid_result = processor.process(
+        img, board_corners,
+        piece_points=piece_bases,
+        method=grid_method,
+    )
+
+    if grid_result is not None:
+        h_lines, v_lines = grid_result
+        h_grid = interpolate_grid(h_lines, WARP_SIZE)
+        v_grid = interpolate_grid(v_lines, WARP_SIZE)
+    else:
+        print("  [warn] Grid detection failed — using uniform grid.")
+        h_grid = np.linspace(0, WARP_SIZE, 9)
+        v_grid = np.linspace(0, WARP_SIZE, 9)
+
+    M = processor.transform_matrix
+
+    # Save warped + grid debug image
+    debug_warped = None
+    if processor.warped_image is not None and output_dir:
+        debug_warped = _draw_grid_on_warped(processor.warped_image, h_grid, v_grid)
+        cv2.imwrite(os.path.join(output_dir, "debug_warped.jpg"), debug_warped)
+        print(f"  [debug] Warped board saved.")
+
+    if M is None:
+        print("[Error] Perspective warp matrix is None.")
+        return None
+
+    # ── 7. Piece-to-cell assignment ───────────────────────────────────────
+    piece_map   = get_piece_mapping()
+    candidates  = []   # [{char, conf, col, row, wx, wy}]
+
+    for kpts, cls, conf in zip(
+            results.keypoints.data, results.boxes.cls, results.boxes.conf):
+        if int(cls) == 0:
+            continue
+
+        pts = kpts.cpu().numpy()
+        base_pts = pts[:3, :2] if len(pts) >= 3 else pts[:, :2]
+
+        mean_x = float(np.mean(base_pts[:, 0]))
+        mean_y = float(np.mean(base_pts[:, 1]))
+
+        # Warp piece base-point centre to the 500×500 grid
+        src = np.array([[[mean_x, mean_y]]], dtype=np.float32)
+        wx, wy = map(float, cv2.perspectiveTransform(src, M)[0][0])
+
+        col, row = get_square_from_grid(wx, wy, h_grid, v_grid)
+
+        candidates.append({
+            'char': piece_map.get(int(cls), '?'),
+            'conf': float(conf),
+            'col':  col,
+            'row':  row,
+            'wx':   wx,
+            'wy':   wy,
+        })
+
+        if debug_warped is not None:
+            cv2.circle(debug_warped, (int(wx), int(wy)), 4, (0, 255, 255), -1)
+
+    # Higher-confidence pieces fill cells first (they win ties)
+    candidates.sort(key=lambda c: c['conf'], reverse=True)
+
+    # ── 8. Populate 8×8 board ─────────────────────────────────────────────
+    board = [['.' for _ in range(8)] for _ in range(8)]
+
+    for cand in candidates:
+        c, r = cand['col'], cand['row']
+        if c == -1 or r == -1:
+            continue
+        if board[r][c] == '.':
+            board[r][c] = cand['char']
+
+    # ── 9. Orientation correction ─────────────────────────────────────────
+    board = correct_orientation(board)
+
+    # Print board for debugging
+    print("\n  Board state:")
+    print("    a b c d e f g h")
+    for i, row in enumerate(board):
+        print(f"  {8-i} {' '.join(row)}")
+
+    # ── 10. FEN generation ────────────────────────────────────────────────
+    fen = board_to_fen(board)
+    print(f"\n  Predicted FEN: {fen}")
+
+    # ── 11. Save outputs ──────────────────────────────────────────────────
+    if output_dir:
+        stem = Path(image_path).stem
+
+        # FEN text file
+        fen_path = os.path.join(output_dir, f"{stem}.txt")
+        with open(fen_path, 'w') as f:
             f.write(fen)
-        print(f"Saved FEN to {fen_path}")
-        
-        # Save Annotated Image
-        save_path = os.path.join(output_dir, f"{base_name}.jpg")
-        
-        # Get the plotted results (BGR)
-        res_plotted = results.plot()
-        
-        # 1. Overlay the detected grid coordinates
-        # 2. Draw the estimated grid lines for debugging
-        
-        # Draw 8x8 Grid on original image (remapped from normalized warp coords covers entire image?)
-        # No, simpler to just overlay text at piece positions like before, but let's try to draw the grid lines.
-        # To draw grid lines on the ORIGINAL image, we need to inverse transform the 500x500 grid points.
-        
-        # Calculate Inverse Matrix
-        if M is not None:
-             try:
-                 M_inv = np.linalg.inv(M)
-                 
-                 # Draw Vertical Lines (from v_grid)
-                 for x in v_grid:
-                     pt_top = np.array([[[x, 0]]], dtype=np.float32)
-                     pt_bot = np.array([[[x, 500]]], dtype=np.float32)
-                     
-                     orig_top = cv2.perspectiveTransform(pt_top, M_inv)[0][0]
-                     orig_bot = cv2.perspectiveTransform(pt_bot, M_inv)[0][0]
-                     
-                     cv2.line(res_plotted, (int(orig_top[0]), int(orig_top[1])), (int(orig_bot[0]), int(orig_bot[1])), (0, 255, 255), 2)
+        print(f"  [save] FEN  → {fen_path}")
 
-                 # Draw Horizontal Lines (from h_grid)
-                 for y in h_grid:
-                     pt_left = np.array([[[0, y]]], dtype=np.float32)
-                     pt_right = np.array([[[500, y]]], dtype=np.float32)
-                     
-                     orig_left = cv2.perspectiveTransform(pt_left, M_inv)[0][0]
-                     orig_right = cv2.perspectiveTransform(pt_right, M_inv)[0][0]
-                     
-                     cv2.line(res_plotted, (int(orig_left[0]), int(orig_left[1])), (int(orig_right[0]), int(orig_right[1])), (0, 255, 255), 2)
-                     
-                 # Key Request: Visualize the 4 Keypoints (Corners) used for the grid
-                 corners_warped = [
-                     [0, 0],     # TL
-                     [500, 0],   # TR
-                     [500, 500], # BR
-                     [0, 500]    # BL
-                 ]
-                 for cx, cy in corners_warped:
-                     pt = np.array([[[cx, cy]]], dtype=np.float32)
-                     orig_pt = cv2.perspectiveTransform(pt, M_inv)[0][0]
-                     # Draw Large Red Dot
-                     cv2.circle(res_plotted, (int(orig_pt[0]), int(orig_pt[1])), 10, (0, 0, 255), -1)
-                     # Draw Circle Outline for visibility
-                     cv2.circle(res_plotted, (int(orig_pt[0]), int(orig_pt[1])), 12, (255, 255, 255), 2)
-                     
-             except Exception as e:
-                 print(f"Could not draw grid lines: {e}")
-
-        # Label Pieces
-        for row in range(8):
-            for col in range(8):
-                char = board_state[row][col]
-                if char != '.':
-                     # Find which piece corresponds to this (reverse mapping is hard specifically)
-                     # Instead, we should have stored the piece coordinates in the loop above.
-                     pass
-
-        # Re-iterating results to draw text (inefficient but simple for debug)
-        for kpts, cls in zip(results.keypoints.data, results.boxes.cls):
-             if int(cls) == 0: continue
-             points = kpts.cpu().numpy()
-             if len(points) >= 3:
-                 base_points = points[:3, :2]
-                 piece_x = np.mean(base_points[:, 0])
-                 piece_y = np.mean(base_points[:, 1])
-                 
-                 # Transform
-                 src_point = np.array([[[piece_x, piece_y]]], dtype=np.float32)
-                 dst_point = cv2.perspectiveTransform(src_point, M)[0][0]
-                 wx, wy = dst_point
-                 c = int(wx // 62.5)
-                 r = int(wy // 62.5)
-                 
-                 if 0 <= c < 8 and 0 <= r < 8:
-                     coord = f"{chr(97+c)}{8-r}"
-                     cv2.putText(res_plotted, coord, (int(piece_x), int(piece_y)), 
-                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-
-        cv2.imwrite(save_path, res_plotted)
-        print(f"Saved inference result to {save_path}")
+        # Annotated image with grid overlay
+        annotated = results.plot()
+        annotated = _draw_grid_on_original(annotated, M, h_grid, v_grid)
+        img_path  = os.path.join(output_dir, f"{stem}.jpg")
+        cv2.imwrite(img_path, annotated)
+        print(f"  [save] IMG  → {img_path}")
 
     return fen
 
-def run_inference(image_source, model_path="runs/chess_pose_train/weights/best.pt", output_dir="result/", grid_method="geometric", force_estimate=False):
-    print(f"Loading model from {model_path}...")
+
+# ══════════════════════════════════════════════════════════════════════════
+# BATCH RUNNER
+# ══════════════════════════════════════════════════════════════════════════
+
+def run_inference(
+        image_source: str,
+        model_path: str      = DEFAULT_MODEL,
+        output_dir: str      = DEFAULT_OUTPUT,
+        grid_method: str     = DEFAULT_GRID,
+        force_estimate: bool = False,
+        sample_size: int     = 20,
+) -> None:
+    """Load the model and run inference on one image OR a directory.
+
+    When given a directory, a random sample of up to `sample_size`
+    non-augmented images is chosen.  If the filenames encode a FEN
+    (7 underscores), accuracy is measured automatically.
+
+    Parameters
+    ----------
+    image_source   : Path to an image file or directory.
+    model_path     : Path to YOLO weights.
+    output_dir     : Where to write debug/result files.
+    grid_method    : 'geometric' or 'canny'.
+    force_estimate : Override board-class detection with piece-hull estimate.
+    sample_size    : Max images to sample when `image_source` is a directory.
+    """
+    print(f"Loading model: {model_path}")
     try:
         model = YOLO(model_path)
     except Exception as e:
-        print(f"Error: Could not load model at {model_path} - {e}")
+        print(f"[Error] Could not load model — {e}")
         return
 
+    # ── Collect image paths ───────────────────────────────────────────────
     if os.path.isdir(image_source):
-        # Process directory recursively to get the overall dataset
-        all_image_paths = []
-        for root, _, files in os.walk(image_source):
-            for f in files:
-                # Skip augmented images
-                if "_aug_" in f.lower():
-                    continue
-                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    all_image_paths.append(os.path.join(root, f))
-                    
-        if not all_image_paths:
-            print(f"No images found in {image_source} or its subdirectories.")
+        all_paths = [
+            os.path.join(root, f)
+            for root, _, files in os.walk(image_source)
+            for f in files
+            if not '_aug_' in f.lower()
+            and f.lower().endswith(('.png', '.jpg', '.jpeg'))
+        ]
+        if not all_paths:
+            print(f"[Error] No images found in {image_source}")
             return
-            
-        # Pick a random sample of 20 images (or all if less than 20)
-        sample_size = min(len(all_image_paths), 20)
-        image_paths = random.sample(all_image_paths, sample_size)
-        print(f"Found {len(all_image_paths)} total images in {image_source}. Randomly selected {sample_size} images for evaluation.")
+
+        n = min(sample_size, len(all_paths))
+        image_paths = random.sample(all_paths, n)
+        print(f"  {len(all_paths)} eligible images found — evaluating {n}.")
     else:
         image_paths = [image_source]
 
-    correct_count = 0
-    total_count = 0  # Only count images that represent FENs
+    # ── Run and evaluate ──────────────────────────────────────────────────
+    correct = 0
+    total   = 0
 
     for img_path in image_paths:
-        print(f"\n--- Processing {img_path} ---")
-        pred_fen = process_single_image(img_path, model, output_dir, grid_method, force_estimate)
-        
+        print(f"\n{'─'*60}")
+        print(f"Image: {img_path}")
+
+        pred_fen = process_single_image(
+            img_path, model, output_dir, grid_method, force_estimate
+        )
         if pred_fen is None:
             continue
-            
-        base_name = Path(img_path).stem
-        
-        # Check if it has 7 underscores or dashes (a valid FEN has 8 parts => 7 separators)
-        underscore_count = base_name.count('_')
-        dash_count = base_name.count('-')
-        
-        if underscore_count == 7 or dash_count == 7:
-            if underscore_count == 7:
-                 raw_fen = base_name.replace("_", "/")
-            else:
-                 raw_fen = base_name.replace("-", "/")
-                 
-            # Clean up suffixes like " w", "(board)", or "_aug_X"
-            clean_fen = raw_fen.split(" ")[0].split("(")[0].split("_aug_")[0].split("/aug/")[0]
-            
-            # Our prediction usually contains the turn info: " w - - 0 1"
-            # So extract just the board part:
-            pred_board_fen = pred_fen.split(" ")[0]
-            
-            if pred_board_fen == clean_fen:
-                print(f"MATCH! Predicted FEN matches filename.")
-                correct_count += 1
-            else:
-                print(f"MISMATCH! \nPred: {pred_board_fen}\nTrue: {clean_fen}")
-                
-            total_count += 1
-        else:
-            print(f"Filename '{base_name}' doesn't look like a FEN. Skipping eval comparison.")
 
-    if total_count > 0:
-        accuracy = (correct_count / total_count) * 100 
-        print(f"\n==========================================")
-        print(f"Testing Complete!")
-        print(f"Total FEN Images Evaluated: {total_count}")
-        print(f"Correct FENs: {correct_count}")
-        print(f"Accuracy: {accuracy:.2f}%")
-        print(f"==========================================")
+        true_fen = parse_fen_from_filename(Path(img_path).stem)
+        if true_fen is None:
+            print("  (No ground-truth FEN in filename — skipping accuracy check.)")
+            continue
+
+        pred_board = pred_fen.split(' ')[0]
+        total += 1
+
+        if pred_board == true_fen:
+            print("  ✓ MATCH")
+            correct += 1
+        else:
+            print(f"  ✗ MISMATCH")
+            print(f"    Pred: {pred_board}")
+            print(f"    True: {true_fen}")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    if total:
+        acc = correct / total * 100
+        print(f"\n{'='*60}")
+        print(f"  FEN Images Evaluated : {total}")
+        print(f"  Correct              : {correct}")
+        print(f"  Accuracy             : {acc:.2f} %")
+        print(f"{'='*60}")
     else:
-        print("\nNo FEN images were evaluated.")
+        print("\n  No FEN-named images to evaluate.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image", help="Path to image file")
-    parser.add_argument("--model", default="runs/chess_pose_train/weights/best.pt", help="Path to trained model")
-    parser.add_argument("--output-dir", default="result/", help="Directory to save results")
-    parser.add_argument("--grid-method", default="geometric", choices=["geometric", "canny"], help="Grid detection method: geometric (default) or canny")
-    parser.add_argument("--force-estimate", action="store_true", help="Force estimation of board from piece locations, ignoring model board detection")
+
+    parser = argparse.ArgumentParser(
+        description="YOLO chess inference pipeline — original version."
+    )
+    parser.add_argument(
+        "image",
+        help="Path to a single image file or a directory of images.",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"YOLO weights path (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT,
+        help=f"Directory for result/debug files (default: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--grid-method",
+        default=DEFAULT_GRID,
+        choices=["geometric", "canny"],
+        help="Grid detection method (default: geometric)",
+    )
+    parser.add_argument(
+        "--force-estimate",
+        action="store_true",
+        help="Estimate board corners from piece convex hull, ignoring the YOLO board class.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Max images to randomly sample when input is a directory (default: 20).",
+    )
     args = parser.parse_args()
-    
-    run_inference(args.image, args.model, args.output_dir, args.grid_method, force_estimate=args.force_estimate)
+
+    run_inference(
+        args.image,
+        model_path     = args.model,
+        output_dir     = args.output_dir,
+        grid_method    = args.grid_method,
+        force_estimate = args.force_estimate,
+        sample_size    = args.sample,
+    )

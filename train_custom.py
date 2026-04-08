@@ -8,8 +8,8 @@ optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout)
 optuna.logging.set_verbosity(optuna.logging.INFO)
 
 # Constants
-MODEL_PATH = "yolov8l-pose.pt" 
-DATA_YAML = "g:/Dean/Thesis/yolo/manual_annotate_dataset/data.yaml"
+MODEL_PATH = "runs/manual_annotate_tuning/trial_11/weights/last.pt" 
+DATA_YAML = "g:/Dean/Thesis/yolo/augmented_dataset_new/data.yaml"
 PROJECT_DIR_TUNE = "g:/Dean/Thesis/yolo/runs/manual_annotate_tuning"
 
 def objective(trial):
@@ -27,15 +27,21 @@ def objective(trial):
             "warmup_bias_lr": trial.suggest_float("warmup_bias_lr", 0.1, 0.9),
             "box": trial.suggest_float("box", 1.0, 10.0),
             "cls": trial.suggest_float("cls", 0.1, 2.0),
-            "pose": trial.suggest_float("pose", 12.0, 30.0),
-            "kobj": trial.suggest_float("kobj", 1.0, 5.0),
+            "pose": trial.suggest_float("pose", 8.0, 30.0),
+            "kobj": trial.suggest_float("kobj", 1.0, 8.0),
             "batch": trial.suggest_categorical("batch", [8, 16]),
-            "epochs": trial.suggest_int("epochs", 30, 80),
+            "epochs": trial.suggest_int("epochs", 60, 150),
             "dropout": trial.suggest_float("dropout", 0.0, 0.3),
-            "fliplr": trial.suggest_categorical("fliplr", [0.0, 0.5]),
+            "fliplr": 0.0,  
             "scale": trial.suggest_float("scale", 0.0, 0.5),
             "translate": trial.suggest_float("translate", 0.0, 0.2),
             "erasing": trial.suggest_float("erasing", 0.0, 0.4),
+            "hsv_v": trial.suggest_float("hsv_v", 0.2, 0.5),
+            "hsv_s": trial.suggest_float("hsv_s", 0.3, 0.7),
+            "degrees": trial.suggest_float("degrees", 0.0, 15.0),
+            "perspective": trial.suggest_float("perspective", 0.0, 0.001),
+            "copy_paste": trial.suggest_float("copy_paste", 0.0, 0.4),
+            "mosaic": trial.suggest_float("mosaic", 0.5, 1.0),
         }
 
     # Initialize model
@@ -59,8 +65,10 @@ def objective(trial):
     if hasattr(results, 'fitness'):
         return results.fitness
     
-    # Fallback validation check
+    # Custom fallback validation check: use pose fitness instead of mAP50 for keypoints
     metrics = model.val(data=DATA_YAML)
+    if hasattr(metrics, 'pose') and hasattr(metrics.pose, 'fitness'):
+        return metrics.pose.fitness
     return metrics.fitness
 
 

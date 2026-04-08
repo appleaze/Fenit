@@ -46,6 +46,13 @@ archive*/
 training/
 manual_annotate_dataset/
 dataset/
+augmented_dataset_new/
+eval_results_Eval/
+eval_results_resume_best/
+eval_results_fixed/
+eval_results_fixed_v2/
+documentation/
+training.zip
 
 # Models
 *.pt

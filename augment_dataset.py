@@ -8,10 +8,10 @@ from tqdm import tqdm
 # --- Configuration ---
 SRC_IMG_DIR = r"G:\Dean\Thesis\yolo\training\images\Train"
 SRC_LBL_DIR = r"G:\Dean\Thesis\yolo\training\labels\Train"
-DST_DIR = r"G:\Dean\Thesis\yolo\manual_annotate_dataset"
+DST_DIR = r"G:\Dean\Thesis\yolo\augmented_dataset_new"
 
 TRAIN_SPLIT = 0.85
-AUGMENT_MULTIPLIER = 3 # 3 augmentations + 1 original for each train image
+AUGMENT_MULTIPLIER = 6  # 6 augmented copies + 1 original per training image
 
 def main():
     # Ensure directories exist
@@ -47,13 +47,31 @@ def main():
         defocus_transform = A.Blur(blur_limit=7, p=0.15)
 
     transform = A.Compose([
-        A.Affine(scale=(0.8, 1.2), p=0.4),                       # Scaling: 40%
-        A.Affine(rotate=(-30, 30), shear=(-30, 30), p=1.0),      # Rotation & Shear: 100%
-        A.GaussianBlur(blur_limit=(3, 7), p=0.25),               # Gaussian Blur: 25%
-        A.GaussNoise(var_limit=(10.0, 50.0), p=0.20),            # Gaussian Noise: 20%
-        defocus_transform                                        # Defocus/Blur: 15%
-    ], 
-    bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'], min_area=0.0, min_visibility=0.0),
+        # ── Geometry ──────────────────────────────────────────────────────
+        A.Affine(scale=(0.8, 1.2), p=0.4),                        # scale 40%
+        A.Affine(rotate=(-30, 30), shear=(-15, 15), p=1.0),       # rotation + shear 100%
+        A.Perspective(scale=(0.04, 0.12), p=0.5),                 # [NEW] projective warp — simulates camera angle
+
+        # ── Colour / Lighting ─────────────────────────────────────────────
+        A.ColorJitter(                                             # [NEW] handles piece colour variation
+            brightness=0.4, contrast=0.4,
+            saturation=0.3, hue=0.05, p=0.8),
+        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.2),    # [NEW] over/under-exposed boards
+
+        # ── Blur / Noise ──────────────────────────────────────────────────
+        A.GaussianBlur(blur_limit=(3, 7), p=0.25),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.20),
+        defocus_transform,
+
+        # ── Occlusion ─────────────────────────────────────────────────────
+        A.CoarseDropout(                                          # [NEW] cutout — forces robust features
+            num_holes_range=(2, 6),
+            hole_height_range=(10, 25),
+            hole_width_range=(10, 25),
+            p=0.3),
+    ],
+    bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'],
+                             min_area=0.0, min_visibility=0.0),
     keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
 
     def parse_yolo_label(lbl_path, w, h):
@@ -151,15 +169,20 @@ def main():
                     aug_flat_kpts = transformed['keypoints']
                     
                     # Unflatten keypoints back into their bounding boxes
+                    # [FIX] Recompute visibility from actual post-transform position
+                    #       (original visibility was pre-transform and is now stale)
+                    aug_h, aug_w = aug_img.shape[:2]
                     aug_keypoints = []
                     idx = 0
                     for orig_box_kpts in keypoints:
                         box_aug_kpts = []
-                        for orig_kp in orig_box_kpts:
-                            orig_pv = orig_kp[2]
+                        for _ in orig_box_kpts:
                             new_px = aug_flat_kpts[idx][0]
                             new_py = aug_flat_kpts[idx][1]
-                            box_aug_kpts.append((new_px, new_py, orig_pv))
+                            # 2=visible & in-frame, 0=invisible/out-of-frame
+                            in_bounds = (0 <= new_px <= aug_w) and (0 <= new_py <= aug_h)
+                            new_pv = 2 if in_bounds else 0
+                            box_aug_kpts.append((new_px, new_py, new_pv))
                             idx += 1
                         aug_keypoints.append(box_aug_kpts)
                     
